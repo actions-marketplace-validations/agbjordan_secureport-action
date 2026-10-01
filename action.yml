@@ -1,0 +1,456 @@
+name: Secureport
+description: >-
+  Upload a scanner's output to Secureport, wait for it to reconcile, render a
+  report, and optionally fail the job on a new or regressed severity.
+
+# **`mode` exists from this first release, not upload-only** (8.3, decided
+# against .findings/P8-findings.md § 1). Adding a required-shaped input later
+# — one every existing install's workflow file lacks — is a breaking change
+# for everyone already using this; adding an unused one now costs nothing.
+# `scan` is accepted so nobody's workflow file has to change when P9 ships,
+# but it refuses today: requesting a real `kind: 'scan'` run before P9 makes
+# hosted scanning execute would leave that run at `running` forever on every
+# PR that used it, and P9.9 is what defines the actual thin-client contract
+# (`.planning/P9-scan-orchestration.md` § 9.9) — a shape this Action must not
+# pre-empt.
+#
+# **Only what's used is an input.** An `api-url` override exists on the CLI
+# already, but nothing here calls for it yet. A report severity floor was
+# flagged as something 8.4 might add — it didn't: the PR comment and job
+# summary render counts only (no issue title or location, ever, on a
+# world-readable surface), and a floor has nothing to filter on counts. 8.4
+# did add `comment`, to turn the PR comment off without losing the job
+# summary. 8.5 added `sarif`: per-issue detail — a title, a location — now has
+# a home that isn't world-readable, gated behind whatever access GitHub code
+# scanning already requires of the repository. The published surface is a
+# promise; every input added grows what a breaking change means.
+#
+# **Composite, not a native JS action** — decided against real research, not
+# by default. See `.findings/P8-findings.md` § 1: GitHub's own
+# `actions/typescript-action` template still ships a committed `dist/` and a
+# drift-guard job for it, and a native action would still duplicate the
+# create → upload → poll → finish → summary sequence 8.2 already built into
+# the CLI, for every non-Action caller (GitLab, Jenkins, a terminal).
+#
+# **Mirrored to a public repository (8.12, B221).** This file is written and
+# edited here, in the private monorepo, then copied verbatim to
+# `agbjordan/secureport-action` by `.github/workflows/action-mirror.yml` on
+# every promotion that touches `action/`. Nothing here assumes the mirror —
+# the steps below only ever install `@secureport/cli` from the public npm
+# registry, never read anything else from this checkout. A change that
+# should reach consumers needs `action/VERSION` bumped in the same commit —
+# see `.github/workflows/action-mirror.yml`'s header for what that triggers.
+
+inputs:
+  mode:
+    description: >-
+      upload (the only mode that does anything today) or scan (accepted for
+      forward compatibility; refuses until P9 ships hosted scanning).
+    required: false
+    default: upload
+  cli-version:
+    description: >-
+      Exact @secureport/cli version to install, e.g. 0.2.0. No default and no
+      ranges accepted — resolving "latest" at Action-run time is the same
+      trap as deploying Cloud Run by :latest, just in a new place. Pin it and
+      bump it deliberately, the way sigstore/cosign-installer's
+      cosign-release input works.
+    required: true
+  target-id:
+    description: Which Secureport target this run is against.
+    required: true
+  file:
+    description: Path to the scanner output file. Required when mode is upload.
+    required: false
+  engine:
+    description: nuclei, zap, burp, nessus or generic. Detected from the file by default.
+    required: false
+    default: ''
+  scope:
+    description: >-
+      What this run covered, as globs — one per line. Default: everything.
+    required: false
+    default: ''
+  report-kind:
+    description: pen, vap, exec, attest or retest.
+    required: false
+    default: vap
+  fail-on:
+    description: >-
+      Fail the job when a new or regressed issue at or above this severity
+      is found (critical, high, medium, low, advisory), or none to never
+      gate on severity.
+    required: false
+    default: none
+  comment:
+    description: >-
+      Post a sticky PR comment (updated in place on every run) mirroring the
+      job summary. true or false. The job summary is written either way —
+      this only controls the PR comment.
+    required: false
+    default: 'true'
+  sarif:
+    description: >-
+      Upload a SARIF rendering of the run's open issues to GitHub code
+      scanning, so they appear inline on the diff. true or false. Needs
+      `security-events: write` on the calling workflow — see action/README.md.
+    required: false
+    default: 'false'
+
+branding:
+  icon: shield
+  color: blue
+
+outputs:
+  run-id:
+    description: The run this Action started. Empty when mode is scan, or when the run could not be created.
+    value: ${{ steps.upload.outputs.run-id }}
+  summary-path:
+    description: Path to the run summary JSON (secureport run upload --format json's output).
+    value: ${{ steps.upload.outputs.summary-path }}
+  report-path:
+    description: Path to the rendered report JSON (secureport report <kind> --run <id> --format json's output).
+    value: ${{ steps.report.outputs.report-path }}
+  outcome:
+    description: passed, threshold-breached or action-required. Unset if inputs were invalid or the CLI itself failed.
+    value: ${{ steps.upload.outputs.outcome || steps.gate.outputs.outcome }}
+
+runs:
+  using: composite
+  steps:
+    # Every input is read through env:, never interpolated directly into a
+    # run: script with ${{ }}. That is script injection hardening this
+    # repo's two internal composite actions don't need — their inputs are
+    # this repo's own workflow, not arbitrary third-party workflow files —
+    # but this Action is public-facing, and a scanner filename or scope glob
+    # is attacker-controlled the moment someone else's workflow sets it from
+    # PR content.
+    - name: Validate inputs
+      id: validate
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        CLI_VERSION: ${{ inputs.cli-version }}
+        TARGET_ID: ${{ inputs.target-id }}
+        FILE: ${{ inputs.file }}
+        REPORT_KIND: ${{ inputs.report-kind }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        COMMENT: ${{ inputs.comment }}
+        SARIF: ${{ inputs.sarif }}
+        IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+      run: |
+        set -euo pipefail
+
+        case "$MODE" in
+          upload|scan) ;;
+          *)
+            echo "::error title=Bad input::mode must be upload or scan (got \"$MODE\")"
+            exit 1
+            ;;
+        esac
+
+        # The one outcome this step exists to give a clear answer for: not a
+        # generic failure, but "this isn't built yet, and here's why" —
+        # P9.9 replaces this branch with the real secureport scan call.
+        if [ "$MODE" = "scan" ]; then
+          echo "::error title=Hosted scanning is not available yet::mode: scan is accepted so your workflow file does not need to change later, but hosted scanning ships with P9. Use mode: upload today."
+          exit 1
+        fi
+
+        # B223: on a fork PR, GITHUB_TOKEN is read-only and secrets are not
+        # passed to the job at all, so SECUREPORT_API_KEY is empty before the
+        # CLI ever runs. Checked here, with a message naming both documented
+        # workarounds, rather than left to surface as the CLI's own generic
+        # "missing credential" error three steps later.
+        if [ -z "${SECUREPORT_API_KEY:-}" ]; then
+          if [ "$IS_FORK" = "true" ]; then
+            echo "::error title=No credential on a fork PR::SECUREPORT_API_KEY is empty because this is a fork pull request — GitHub does not pass secrets to fork PR jobs. See action/README.md's Fork PRs section for the two options: pull_request_target (checks out untrusted code; read the caution there first) or restricting this Action to same-repository PRs."
+          else
+            echo "::error title=Missing credential::SECUREPORT_API_KEY is not set. Set it in the env: of the step that calls this Action, from a repository secret — see action/README.md's Usage section."
+          fi
+          exit 1
+        fi
+
+        if [ -z "$TARGET_ID" ]; then
+          echo "::error title=Bad input::target-id is required"
+          exit 1
+        fi
+        if [ -z "$FILE" ]; then
+          echo "::error title=Bad input::file is required when mode is upload"
+          exit 1
+        fi
+
+        # An exact version only — no ^, ~, x-range or dist-tag. Checked here,
+        # before npm ever sees it, so "latest" fails with this sentence
+        # rather than with whatever error npm gives for a moving target.
+        if ! [[ "$CLI_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          echo "::error title=Bad input::cli-version must be an exact version such as 0.2.0, not \"$CLI_VERSION\" — a range or a moving tag resolves differently on every run"
+          exit 1
+        fi
+
+        case "$REPORT_KIND" in
+          pen|vap|exec|attest|retest) ;;
+          *)
+            echo "::error title=Bad input::report-kind must be one of pen, vap, exec, attest, retest (got \"$REPORT_KIND\")"
+            exit 1
+            ;;
+        esac
+
+        case "$FAIL_ON" in
+          none|critical|high|medium|low|advisory) ;;
+          *)
+            echo "::error title=Bad input::fail-on must be none, critical, high, medium, low or advisory (got \"$FAIL_ON\")"
+            exit 1
+            ;;
+        esac
+
+        case "$COMMENT" in
+          true|false) ;;
+          *)
+            echo "::error title=Bad input::comment must be true or false (got \"$COMMENT\")"
+            exit 1
+            ;;
+        esac
+
+        case "$SARIF" in
+          true|false) ;;
+          *)
+            echo "::error title=Bad input::sarif must be true or false (got \"$SARIF\")"
+            exit 1
+            ;;
+        esac
+
+    # A single install, not npx per call — one clear step whose failure
+    # means "the pin is wrong", rather than that surfacing obscurely inside
+    # whichever later step happened to resolve the package first.
+    - name: Install @secureport/cli@${{ inputs.cli-version }}
+      id: install
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -euo pipefail
+        npm install --global --no-audit --no-fund "@secureport/cli@${CLI_VERSION}"
+
+        # Asserts what actually got installed, not what was asked for — the
+        # same reasoning as Cloud Run's /version check after a deploy.
+        actual=$(secureport --version)
+        if [ "$actual" != "$CLI_VERSION" ]; then
+          echo "::error title=Version mismatch::asked to install ${CLI_VERSION}, npm installed ${actual}"
+          exit 1
+        fi
+
+    # Credentials are never an input — see the module doc in
+    # packages/cli/src/hosted.ts. The workflow that calls this Action sets
+    # SECUREPORT_API_KEY and SECUREPORT_API_URL in the env: of the step that
+    # invokes it (from ${{ secrets.* }}), and this step inherits them as real
+    # process environment — the CLI reads them itself and gives its own
+    # usage error if either is missing.
+    #
+    # Exit 3 (--fail-on met its floor) is swallowed here, not raised: the
+    # report step and the gate step both still need to run. Exit 4
+    # (terms_required / verification_required) fails immediately, since
+    # there is no run to report on.
+    - name: Upload ${{ inputs.file }}
+      id: upload
+      shell: bash
+      env:
+        TARGET_ID: ${{ inputs.target-id }}
+        FILE: ${{ inputs.file }}
+        ENGINE: ${{ inputs.engine }}
+        SCOPE: ${{ inputs.scope }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${RUNNER_TEMP}/secureport"
+        summary="${RUNNER_TEMP}/secureport/summary.json"
+
+        args=(run upload "$FILE" --target "$TARGET_ID" --trigger github_action --format json)
+        [ -n "$ENGINE" ] && args+=(--engine "$ENGINE")
+        [ -n "$FAIL_ON" ] && [ "$FAIL_ON" != "none" ] && args+=(--fail-on "$FAIL_ON")
+        while IFS= read -r glob; do
+          [ -n "$glob" ] && args+=(--scope "$glob")
+        done <<< "$SCOPE"
+
+        # Under $RUNNER_TEMP, not the caller's workspace: 8.4's "Summarise"
+        # step below reads this same file for `action-required`'s message,
+        # and needs a path fixed enough to compute without a round-trip
+        # output — $RUNNER_TEMP/secureport is already where summary.json and
+        # report.json land.
+        stderr="${RUNNER_TEMP}/secureport/upload-stderr.txt"
+
+        set +e
+        secureport "${args[@]}" >"$summary" 2>"$stderr"
+        code=$?
+        set -e
+        cat "$stderr" >&2
+
+        if [ "$code" -eq 4 ]; then
+          echo "::error title=Action needed in Secureport::$(cat "$stderr")"
+          echo "outcome=action-required" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+        if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+          echo "::error title=secureport run upload failed::$(cat "$stderr")"
+          exit "$code"
+        fi
+
+        run_id=$(jq -r '.runId' "$summary")
+        {
+          echo "run-id=${run_id}"
+          echo "summary-path=${summary}"
+          echo "threshold-breached=$([ "$code" -eq 3 ] && echo true || echo false)"
+        } >> "$GITHUB_OUTPUT"
+
+    # Rendered even when the severity gate below is about to fail the job —
+    # a breach is exactly when 8.4's PR comment most needs something to show.
+    - name: Render the ${{ inputs.report-kind }} report
+      id: report
+      shell: bash
+      env:
+        REPORT_KIND: ${{ inputs.report-kind }}
+        RUN_ID: ${{ steps.upload.outputs.run-id }}
+      run: |
+        set -euo pipefail
+        report="${RUNNER_TEMP}/secureport/report.json"
+        secureport report "$REPORT_KIND" --run "$RUN_ID" --format json --out "$report"
+        echo "report-path=${report}" >> "$GITHUB_OUTPUT"
+
+    # Only when `sarif: true`. Per-issue detail (a title, a location) has no
+    # home on the world-readable PR comment or job summary — 8.4's
+    # counts-only decision is permanent, not a placeholder — so this is
+    # where it goes instead: GitHub code scanning, gated behind whatever
+    # access the repository already requires for that. `report-kind` is
+    # still required by `secureport report`'s own parsing, but SARIF ignores
+    # it — it is always "every open issue right now," never a retest or an
+    # attestation (see `SarifOptions`'s own doc in `@secureport/core`).
+    - name: Render SARIF
+      id: sarif
+      if: ${{ inputs.sarif == 'true' && steps.report.outcome == 'success' }}
+      shell: bash
+      env:
+        REPORT_KIND: ${{ inputs.report-kind }}
+        RUN_ID: ${{ steps.upload.outputs.run-id }}
+      run: |
+        set -euo pipefail
+        sarif="${RUNNER_TEMP}/secureport/results.sarif"
+        secureport report "$REPORT_KIND" --run "$RUN_ID" --format sarif --out "$sarif"
+        echo "sarif-path=${sarif}" >> "$GITHUB_OUTPUT"
+
+    # A real GitHub Action, not hand-rolled — checked against `.claude/rules`
+    # first, the same as 8.3's composite-vs-native research. Pinned by commit
+    # SHA resolved from the `v4.38.2` tag (`gh api
+    # repos/github/codeql-action/git/refs/tags/v4.38.2`, dereferenced past its
+    # annotated-tag object to the commit it points at), not trusted from a
+    # first search result — the same check 8.4 ran for
+    # `actions/github-script`. `category` scopes the alert set to this
+    # target: two targets uploading into the same repository must not
+    # overwrite each other's alerts.
+    #
+    # `continue-on-error`, matching the PR comment step below: a missing
+    # `security-events: write` permission is a configuration mistake the job
+    # summary and PR comment already carried the run's real result without,
+    # so it should not fail a job whose severity gate otherwise passed.
+    - name: Upload SARIF to code scanning
+      id: sarif-upload
+      if: ${{ inputs.sarif == 'true' && steps.sarif.outcome == 'success' }}
+      continue-on-error: true
+      uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      with:
+        sarif_file: ${{ steps.sarif.outputs.sarif-path }}
+        category: secureport-${{ inputs.target-id }}
+
+    # Bridges the step outputs above into `secureport ci-summary`'s CLI verb
+    # — the one typed, tested renderer (8.4, `.findings/P8-findings.md` § 1)
+    # the job summary and the PR comment both come from, rather than either
+    # being written as inline YAML.
+    #
+    # Runs whenever the report above actually rendered — `steps.report.outcome
+    # == 'success'`, the default `if: success()` every unconditioned step
+    # already carries, spelled out here because the second half of this `if`
+    # needs to override it — **or** when there was never a report to render
+    # because the API needs a person in the dashboard first
+    # (`steps.upload.outputs.outcome == 'action-required'`, set by the upload
+    # step just before its own `exit 1`, which is what the second half
+    # overrides). `!cancelled()` on a custom expression is required here, not
+    # decorative: writing any non-default `if:` drops the implicit
+    # "and the run wasn't cancelled" GitHub otherwise ANDs in.
+    - name: Summarise
+      id: summarise
+      if: ${{ !cancelled() && (steps.report.outcome == 'success' || steps.upload.outputs.outcome == 'action-required') }}
+      shell: bash
+      env:
+        UPLOAD_OUTCOME: ${{ steps.upload.outputs.outcome }}
+        BREACHED: ${{ steps.upload.outputs.threshold-breached }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        TARGET_ID: ${{ inputs.target-id }}
+        REPORT_PATH: ${{ steps.report.outputs.report-path }}
+        SARIF_UPLOADED: ${{ steps.sarif-upload.outcome == 'success' }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${RUNNER_TEMP}/secureport"
+        ci_summary="${RUNNER_TEMP}/secureport/ci-summary.json"
+
+        if [ "$UPLOAD_OUTCOME" = "action-required" ]; then
+          stderr="${RUNNER_TEMP}/secureport/upload-stderr.txt"
+          secureport ci-summary --outcome action-required --target "$TARGET_ID" \
+            --message "$(cat "$stderr")" --format json --out "$ci_summary"
+        else
+          args=(ci-summary "$REPORT_PATH" --format json --out "$ci_summary")
+          if [ "$BREACHED" = "true" ]; then
+            args+=(--outcome threshold-breached --fail-on "$FAIL_ON")
+          else
+            args+=(--outcome passed)
+            [ -n "$FAIL_ON" ] && [ "$FAIL_ON" != "none" ] && args+=(--fail-on "$FAIL_ON")
+          fi
+          # Only a pointer to where the detail is, never the detail itself —
+          # 8.4's counts-only comment/summary keep their own shape. Best
+          # effort: `$SARIF_UPLOADED` reflects whether the render-and-upload
+          # steps reported success, not whether GitHub finished processing
+          # the file, so a broken link here costs nothing but a dead click.
+          if [ "$SARIF_UPLOADED" = "true" ]; then
+            args+=(--code-scanning-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/security/code-scanning")
+          fi
+          secureport "${args[@]}"
+        fi
+
+        jq -r '.markdown' "$ci_summary" >> "$GITHUB_STEP_SUMMARY"
+        echo "ci-summary-path=${ci_summary}" >> "$GITHUB_OUTPUT"
+
+    # `sticky-comment.cjs` (typed, tested — action/tests/sticky-comment.test.mjs)
+    # does the actual GitHub API work; this step only reads the file
+    # Summarise wrote and hands it over. Never fails the job on its own — a
+    # posting failure (most often a fork PR's read-only GITHUB_TOKEN, see
+    # action/README.md) is a warning inside the script, and the job summary
+    # above already carries the same result.
+    - name: Comment on the pull request
+      if: ${{ !cancelled() && inputs.comment == 'true' && (steps.report.outcome == 'success' || steps.upload.outputs.outcome == 'action-required') }}
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        CI_SUMMARY_PATH: ${{ steps.summarise.outputs.ci-summary-path }}
+      with:
+        script: |
+          const fs = require('fs');
+          const summary = JSON.parse(fs.readFileSync(process.env.CI_SUMMARY_PATH, 'utf8'));
+          const post = require(`${process.env.GITHUB_ACTION_PATH}/sticky-comment.cjs`);
+          await post({ github, context, core }, summary);
+
+    # Split from the upload step so the report above still renders on a
+    # breach. Only runs once upload actually succeeded (soft or hard 0/3) —
+    # never after validate/install/action-required, which have already
+    # failed the job with their own, more specific message.
+    - name: Gate on --fail-on
+      id: gate
+      if: steps.upload.outcome == 'success'
+      shell: bash
+      env:
+        FAIL_ON: ${{ inputs.fail-on }}
+        BREACHED: ${{ steps.upload.outputs.threshold-breached }}
+      run: |
+        set -euo pipefail
+        if [ "$BREACHED" = "true" ]; then
+          echo "::error title=Severity gate failed::a new or regressed issue at or above ${FAIL_ON} was found"
+          echo "outcome=threshold-breached" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+        echo "outcome=passed" >> "$GITHUB_OUTPUT"
