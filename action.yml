@@ -1,18 +1,15 @@
 name: Secureport
 description: >-
-  Upload a scanner's output to Secureport, wait for it to reconcile, render a
+  Upload a scanner's output to Secureport, or ask it to scan a target, render a
   report, and optionally fail the job on a new or regressed severity.
 
 # **`mode` exists from this first release, not upload-only** (8.3, decided
 # against .findings/P8-findings.md § 1). Adding a required-shaped input later
 # — one every existing install's workflow file lacks — is a breaking change
 # for everyone already using this; adding an unused one now costs nothing.
-# `scan` is accepted so nobody's workflow file has to change when P9 ships,
-# but it refuses today: requesting a real `kind: 'scan'` run before P9 makes
-# hosted scanning execute would leave that run at `running` forever on every
-# PR that used it, and P9.9 is what defines the actual thin-client contract
-# (`.planning/P9-scan-orchestration.md` § 9.9) — a shape this Action must not
-# pre-empt.
+# `scan` runs `secureport scan` since P9.9 (`.planning/P9-scan-orchestration.md`
+# § 9.9): fire-and-forget by default, so a customer's runner never bills
+# their minutes on our compute; `wait: true` opts into gating on the result.
 #
 # **Only what's used is an input.** An `api-url` override exists on the CLI
 # already, but nothing here calls for it yet. A report severity floor was
@@ -44,10 +41,17 @@ description: >-
 inputs:
   mode:
     description: >-
-      upload (the only mode that does anything today) or scan (accepted for
-      forward compatibility; refuses until P9 ships hosted scanning).
+      upload (send a scanner file you already have) or scan (ask Secureport to
+      scan the target; starts the run and returns unless wait is true).
     required: false
     default: upload
+  wait:
+    description: >-
+      mode scan only. true waits for the scan to end, up to the time the API
+      says it will have ended by, so the report and fail-on can use it — in
+      this job's billed minutes. Default false: start it and move on.
+    required: false
+    default: 'false'
   cli-version:
     description: >-
       Exact @secureport/cli version to install, e.g. 0.2.0. No default and no
@@ -60,15 +64,16 @@ inputs:
     description: Which Secureport target this run is against.
     required: true
   file:
-    description: Path to the scanner output file. Required when mode is upload.
+    description: Path to the scanner output file. Required when mode is upload; refused when scan.
     required: false
   engine:
-    description: nuclei, zap, burp, nessus or generic. Detected from the file by default.
+    description: nuclei, zap, burp, nessus or generic. Detected from the file by default. upload only.
     required: false
     default: ''
   scope:
     description: >-
       What this run covered, as globs — one per line. Default: everything.
+      upload only: a scan's coverage is recorded by Secureport, never claimed.
     required: false
     default: ''
   report-kind:
@@ -79,7 +84,7 @@ inputs:
     description: >-
       Fail the job when a new or regressed issue at or above this severity
       is found (critical, high, medium, low, advisory), or none to never
-      gate on severity.
+      gate on severity. With mode scan, needs wait: true.
     required: false
     default: none
   comment:
@@ -103,16 +108,19 @@ branding:
 
 outputs:
   run-id:
-    description: The run this Action started. Empty when mode is scan, or when the run could not be created.
+    description: The run this Action started, upload or scan. Empty when the run could not be created.
     value: ${{ steps.upload.outputs.run-id }}
   summary-path:
-    description: Path to the run summary JSON (secureport run upload --format json's output).
+    description: Path to the run summary JSON. Empty for a scan started without wait — it has no summary yet.
     value: ${{ steps.upload.outputs.summary-path }}
   report-path:
     description: Path to the rendered report JSON (secureport report <kind> --run <id> --format json's output).
     value: ${{ steps.report.outputs.report-path }}
   outcome:
-    description: passed, threshold-breached or action-required. Unset if inputs were invalid or the CLI itself failed.
+    description: >-
+      passed, threshold-breached, action-required, or started (a scan began
+      and this job did not wait for it). Unset if inputs were invalid or the
+      CLI itself failed.
     value: ${{ steps.upload.outputs.outcome || steps.gate.outputs.outcome }}
 
 runs:
@@ -130,6 +138,9 @@ runs:
       shell: bash
       env:
         MODE: ${{ inputs.mode }}
+        WAIT: ${{ inputs.wait }}
+        ENGINE: ${{ inputs.engine }}
+        SCOPE: ${{ inputs.scope }}
         CLI_VERSION: ${{ inputs.cli-version }}
         TARGET_ID: ${{ inputs.target-id }}
         FILE: ${{ inputs.file }}
@@ -149,13 +160,13 @@ runs:
             ;;
         esac
 
-        # The one outcome this step exists to give a clear answer for: not a
-        # generic failure, but "this isn't built yet, and here's why" —
-        # P9.9 replaces this branch with the real secureport scan call.
-        if [ "$MODE" = "scan" ]; then
-          echo "::error title=Hosted scanning is not available yet::mode: scan is accepted so your workflow file does not need to change later, but hosted scanning ships with P9. Use mode: upload today."
-          exit 1
-        fi
+        case "$WAIT" in
+          true|false) ;;
+          *)
+            echo "::error title=Bad input::wait must be true or false (got \"$WAIT\")"
+            exit 1
+            ;;
+        esac
 
         # B223: on a fork PR, GITHUB_TOKEN is read-only and secrets are not
         # passed to the job at all, so SECUREPORT_API_KEY is empty before the
@@ -175,9 +186,26 @@ runs:
           echo "::error title=Bad input::target-id is required"
           exit 1
         fi
-        if [ -z "$FILE" ]; then
-          echo "::error title=Bad input::file is required when mode is upload"
-          exit 1
+        # Refused rather than ignored: a scan derives its own reach, so a
+        # silently dropped scope would misstate what this job covered.
+        if [ "$MODE" = "upload" ]; then
+          if [ -z "$FILE" ]; then
+            echo "::error title=Bad input::file is required when mode is upload"
+            exit 1
+          fi
+          if [ "$WAIT" = "true" ]; then
+            echo "::error title=Bad input::wait applies to mode: scan only — an upload always waits"
+            exit 1
+          fi
+        else
+          if [ -n "$FILE" ] || [ -n "$ENGINE" ] || [ -n "$SCOPE" ]; then
+            echo "::error title=Bad input::file, engine and scope are for mode: upload — a scan records its own coverage"
+            exit 1
+          fi
+          if [ "$FAIL_ON" != "none" ] && [ "$WAIT" != "true" ]; then
+            echo "::error title=Bad input::fail-on with mode: scan needs wait: true — without it the scan has not finished when this job ends"
+            exit 1
+          fi
         fi
 
         # An exact version only — no ^, ~, x-range or dist-tag. Checked here,
@@ -249,12 +277,15 @@ runs:
     #
     # Exit 3 (--fail-on met its floor) is swallowed here, not raised: the
     # report step and the gate step both still need to run. Exit 4
-    # (terms_required / verification_required) fails immediately, since
-    # there is no run to report on.
-    - name: Upload ${{ inputs.file }}
+    # (terms_required / verification_required / quota_exceeded) fails
+    # immediately, since there is no run to report on. The id stays `upload`
+    # for both modes — every step below, and 8.4's summary, reads it.
+    - name: ${{ inputs.mode == 'scan' && 'Start a scan' || format('Upload {0}', inputs.file) }}
       id: upload
       shell: bash
       env:
+        MODE: ${{ inputs.mode }}
+        WAIT: ${{ inputs.wait }}
         TARGET_ID: ${{ inputs.target-id }}
         FILE: ${{ inputs.file }}
         ENGINE: ${{ inputs.engine }}
@@ -265,12 +296,19 @@ runs:
         mkdir -p "${RUNNER_TEMP}/secureport"
         summary="${RUNNER_TEMP}/secureport/summary.json"
 
-        args=(run upload "$FILE" --target "$TARGET_ID" --trigger github_action --format json)
-        [ -n "$ENGINE" ] && args+=(--engine "$ENGINE")
+        if [ "$MODE" = "scan" ]; then
+          verb="scan"
+          args=(scan --target "$TARGET_ID" --trigger github_action --format json)
+          [ "$WAIT" = "true" ] && args+=(--wait)
+        else
+          verb="run upload"
+          args=(run upload "$FILE" --target "$TARGET_ID" --trigger github_action --format json)
+          [ -n "$ENGINE" ] && args+=(--engine "$ENGINE")
+          while IFS= read -r glob; do
+            [ -n "$glob" ] && args+=(--scope "$glob")
+          done <<< "$SCOPE"
+        fi
         [ -n "$FAIL_ON" ] && [ "$FAIL_ON" != "none" ] && args+=(--fail-on "$FAIL_ON")
-        while IFS= read -r glob; do
-          [ -n "$glob" ] && args+=(--scope "$glob")
-        done <<< "$SCOPE"
 
         # Under $RUNNER_TEMP, not the caller's workspace: 8.4's "Summarise"
         # step below reads this same file for `action-required`'s message,
@@ -291,14 +329,28 @@ runs:
           exit 1
         fi
         if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
-          echo "::error title=secureport run upload failed::$(cat "$stderr")"
+          echo "::error title=secureport ${verb} failed::$(cat "$stderr")"
           exit "$code"
+        fi
+
+        # Fire-and-forget printed the Run, not a summary: there is nothing to
+        # report on or gate yet, and `finished=false` tells the steps below so.
+        if [ "$MODE" = "scan" ] && [ "$WAIT" != "true" ]; then
+          run_id=$(jq -r '.id' "$summary")
+          {
+            echo "run-id=${run_id}"
+            echo "finished=false"
+            echo "outcome=started"
+          } >> "$GITHUB_OUTPUT"
+          echo "Secureport scan \`${run_id}\` started against target \`${TARGET_ID}\`. This job did not wait for it — \`secureport scan status ${run_id}\` shows where it is." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
         fi
 
         run_id=$(jq -r '.runId' "$summary")
         {
           echo "run-id=${run_id}"
           echo "summary-path=${summary}"
+          echo "finished=true"
           echo "threshold-breached=$([ "$code" -eq 3 ] && echo true || echo false)"
         } >> "$GITHUB_OUTPUT"
 
@@ -306,6 +358,7 @@ runs:
     # a breach is exactly when 8.4's PR comment most needs something to show.
     - name: Render the ${{ inputs.report-kind }} report
       id: report
+      if: steps.upload.outputs.finished == 'true'
       shell: bash
       env:
         REPORT_KIND: ${{ inputs.report-kind }}
@@ -436,12 +489,12 @@ runs:
           await post({ github, context, core }, summary);
 
     # Split from the upload step so the report above still renders on a
-    # breach. Only runs once upload actually succeeded (soft or hard 0/3) —
-    # never after validate/install/action-required, which have already
-    # failed the job with their own, more specific message.
+    # breach. Only runs once a run actually finished (soft or hard 0/3) —
+    # never after validate/install/action-required, nor for a scan nobody
+    # waited for, whose `outcome=started` already stands.
     - name: Gate on --fail-on
       id: gate
-      if: steps.upload.outcome == 'success'
+      if: steps.upload.outcome == 'success' && steps.upload.outputs.finished == 'true'
       shell: bash
       env:
         FAIL_ON: ${{ inputs.fail-on }}
