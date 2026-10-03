@@ -1,7 +1,7 @@
-name: Secureport
+name: Secureport Security Report
 description: >-
-  Upload a scanner's output to Secureport, or ask it to scan a target, render a
-  report, and optionally fail the job on a new or regressed severity.
+  Upload scanner output to Secureport or start a scan, render the report, and
+  fail the job on new or regressed issues.
 
 # **`mode` exists from this first release, not upload-only** (8.3, decided
 # against .findings/P8-findings.md § 1). Adding a required-shaped input later
