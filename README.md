@@ -2,13 +2,12 @@
 
 Uploads a scanner's output to Secureport — or asks Secureport to scan the
 target — renders a report, and optionally fails the job on a new or regressed
-severity.
+issue at or above a severity you choose.
 
-This repository is a public mirror of the `action/` directory in
-[`agbjordan/secureport`](https://github.com/agbjordan/secureport), the
-private monorepo this project is developed in. It's kept in sync
-automatically on every promotion that changes the Action — don't send pull
-requests here; open them against the source repo instead. See
+This repository is a public mirror of the `action/` directory of the private
+monorepo this project is developed in. It's kept in sync automatically on every
+promotion that changes the Action, so pull requests here can't be merged — open
+an issue here instead. See
 [`@secureport/cli` on npm](https://www.npmjs.com/package/@secureport/cli)
 for the CLI this Action wraps, and `secureport --help` for every command it
 runs under the hood.
@@ -20,9 +19,9 @@ permissions:
   pull-requests: write # only needed for the PR comment — see Permissions below
 
 steps:
-  - uses: agbjordan/secureport-action@56265d14e5de1e0066ba66bfe123495a9cc866a6 # v1.0.0
+  - uses: agbjordan/secureport-action@3e92dc7d10c8916a63a93fef108b55127fcf5975 # v1.1.1
     with:
-      cli-version: '0.5.1' # exact version, never a range or a moving tag — 0.2.0 predates hosted mode
+      cli-version: '0.10.1' # exact version, never a range or a moving tag — 0.2.0 predates hosted mode
       target-id: target_your_target_id
       file: scan-results.jsonl
       fail-on: high # optional — omit or 'none' to never gate on severity
@@ -41,10 +40,10 @@ To have Secureport run the scan instead of uploading one, set `mode: scan` and
 drop `file` (needs `cli-version: '0.6.0'` or later):
 
 ```yaml
-- uses: agbjordan/secureport-action@v1
+- uses: agbjordan/secureport-action@3e92dc7d10c8916a63a93fef108b55127fcf5975 # v1.1.1
   with:
     mode: scan
-    cli-version: '0.6.0'
+    cli-version: '0.10.1'
     target-id: target_your_target_id
     # wait: true      # optional — wait for the result so fail-on can gate the PR
     # fail-on: high   # needs wait: true
@@ -60,27 +59,26 @@ compute. The job starts the run, writes its id to the job summary, sets
 opts in, bounded by when the API says the scan will have ended by, priced in
 your minutes by your choice.
 
-**The API key is never a `with:` input** — the same reasoning as
-`packages/cli/src/hosted.ts`'s module doc: a `with:` value is logged and
-visible in the workflow file's rendered inputs, where a `secrets.*`-sourced
-`env:` value is masked. Set it in the `env:` of the step above, and the
+**The API key is never a `with:` input.** A `with:` value is logged and visible
+in the workflow file's rendered inputs, where a `secrets.*`-sourced `env:`
+value is masked. Set it in the `env:` of the step above, and the
 CLI reads it from the environment directly.
 
 ## Inputs
 
-| Input         | Required | Default    | Notes                                                                                                                                                    |
-| ------------- | -------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mode`        | no       | `upload`   | `upload` sends a file you already have; `scan` asks Secureport to scan the target — see above                                                            |
-| `wait`        | no       | `false`    | `scan` only. Wait for the scan to end so the report, comment and `fail-on` can use it                                                                    |
-| `cli-version` | **yes**  | —          | Exact `@secureport/cli` version, e.g. `0.2.0`. No ranges, no `latest`                                                                                    |
-| `target-id`   | yes      | —          | Which Secureport target this run is against                                                                                                              |
-| `file`        | upload   | —          | Path to the scanner output file. Refused with `scan`                                                                                                     |
-| `engine`      | no       | detected   | `nuclei`, `zap`, `burp`, `nessus` or `generic`. `upload` only                                                                                            |
-| `scope`       | no       | everything | Globs covered by this run, one per line. `upload` only — a scan records its own coverage                                                                 |
-| `report-kind` | no       | `vap`      | `pen`, `vap`, `exec`, `attest` or `retest`                                                                                                               |
-| `fail-on`     | no       | `none`     | Fail the job on a new/regressed issue at or above this severity. With `scan`, needs `wait: true`                                                         |
-| `comment`     | no       | `true`     | Post a sticky PR comment, updated in place on every run. The job summary is always written; this only controls the comment                               |
-| `sarif`       | no       | `false`    | Upload the run's open issues to GitHub code scanning as SARIF, so they appear inline on the diff. Needs `security-events: write` — see Permissions below |
+| Input         | Required | Default    | Notes                                                                                                                                                                                                       |
+| ------------- | -------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`        | no       | `upload`   | `upload` sends a file you already have; `scan` asks Secureport to scan the target — see above                                                                                                               |
+| `wait`        | no       | `false`    | `scan` only. Wait for the scan to end so the report, comment and `fail-on` can use it                                                                                                                       |
+| `cli-version` | **yes**  | —          | Exact `@secureport/cli` version, e.g. `0.10.1`. No ranges, no `latest`                                                                                                                                      |
+| `target-id`   | yes      | —          | Which Secureport target this run is against                                                                                                                                                                 |
+| `file`        | upload   | —          | Path to the scanner output file. Refused with `scan`                                                                                                                                                        |
+| `engine`      | no       | detected   | `nuclei`, `zap`, `burp`, `nessus` or `generic`. `upload` only                                                                                                                                               |
+| `scope`       | no       | everything | Globs covered by this run, one per line. `upload` only — a scan records its own coverage                                                                                                                    |
+| `report-kind` | no       | `vap`      | `pen`, `vap`, `exec`, `attest` or `retest`                                                                                                                                                                  |
+| `fail-on`     | no       | `none`     | Fail the job on a new/regressed issue at or above this severity. With `scan`, needs `wait: true`                                                                                                            |
+| `comment`     | no       | `true`     | Post a sticky PR comment, updated in place on every run. The job summary is written whenever there is something to report (a result, a started scan, or an action required); this only controls the comment |
+| `sarif`       | no       | `false`    | Upload the run's open issues to GitHub code scanning as SARIF, so they appear inline on the diff. Needs `security-events: write` — see Permissions below                                                    |
 
 ## Outputs
 
@@ -101,7 +99,7 @@ dashboard, then re-run.
 
 ## The PR comment and job summary
 
-Every run writes a job summary, and — on a `pull_request` event, unless
+Every run that has something to report writes a job summary, and — on a `pull_request` event, unless
 `comment: false` — a sticky PR comment: one comment per target, updated in
 place rather than posted fresh each time. Both are rendered by
 `secureport ci-summary`, the same typed function either way.
@@ -145,7 +143,7 @@ With `sarif: true`, the run's currently-open issues are rendered as SARIF
 diff and in the repository's Security tab — a title and a location, the
 detail the PR comment and job summary deliberately never show. Resolved and
 suppressed issues never appear in the upload: SARIF is the input to GitHub's
-own diffing, and including a resolved issue would tell GitHub the finding is
+own diffing, and including a resolved issue would tell GitHub the alert is
 still open.
 
 Uploads are scoped to this target (`category: secureport-<target-id>`), so
@@ -193,10 +191,10 @@ if: github.event.pull_request.head.repo.full_name == github.repository
 
 Mirrors `@secureport/cli`'s own contract (`secureport --help`):
 
-| Exit | Meaning                                                                                                                 |
-| ---- | ----------------------------------------------------------------------------------------------------------------------- |
-| 0    | it worked                                                                                                               |
-| 3    | `--fail-on` found a new or regressed issue at the floor — the run itself still succeeded, and the report still rendered |
-| 4    | the API needs a person in the dashboard (terms, verification, scan quota) — `outcome=action-required`                   |
+| Exit | Meaning                                                                                                                  |
+| ---- | ------------------------------------------------------------------------------------------------------------------------ |
+| 0    | it worked                                                                                                                |
+| 3    | `--fail-on` found a new or regressed issue at the floor — the run itself still succeeded, and the report still rendered  |
+| 4    | the API needs a person in the dashboard (terms, verification, scan quota) — `outcome=action-required`, and the job fails |
 
 Anything else fails the step with the CLI's own error message.

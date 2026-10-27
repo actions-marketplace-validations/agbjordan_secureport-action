@@ -54,7 +54,7 @@ inputs:
     default: 'false'
   cli-version:
     description: >-
-      Exact @secureport/cli version to install, e.g. 0.2.0. No default and no
+      Exact @secureport/cli version to install, e.g. 0.10.1. No default and no
       ranges accepted — resolving "latest" at Action-run time is the same
       trap as deploying Cloud Run by :latest, just in a new place. Pin it and
       bump it deliberately, the way sigstore/cosign-installer's
@@ -212,7 +212,7 @@ runs:
         # before npm ever sees it, so "latest" fails with this sentence
         # rather than with whatever error npm gives for a moving target.
         if ! [[ "$CLI_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-          echo "::error title=Bad input::cli-version must be an exact version such as 0.2.0, not \"$CLI_VERSION\" — a range or a moving tag resolves differently on every run"
+          echo "::error title=Bad input::cli-version must be an exact version such as 0.10.1, not \"$CLI_VERSION\" — a range or a moving tag resolves differently on every run"
           exit 1
         fi
 
