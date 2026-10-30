@@ -161,7 +161,9 @@ The job summary needs nothing. The PR comment needs the calling workflow to
 grant `permissions: pull-requests: write` (or the broader `issues: write` —
 GitHub accepts either for comment reads and writes). `sarif: true` needs
 `permissions: security-events: write`; on a private repository, also
-`contents: read`. Neither missing permission fails the job on its own —
+`contents: read` and `actions: read` (GitHub's SARIF upload page lists both for
+private repositories, though the codeql-action README names only the first).
+Neither missing permission fails the job on its own —
 the PR comment step never throws, and the SARIF upload step runs with
 `continue-on-error: true` — because the job summary above either already
 carries the run's real result. Both failures are still visible: a `403` from
